@@ -1,19 +1,49 @@
 const express = require('express');
-const fs = require('fs');
+const admin = require('firebase-admin');
 const app = express();
-
-// Middleware untuk mem-parsing JSON dari Roblox
 app.use(express.json());
 
-const SECRET_KEY = "MingHubSuperSecretKey2026";
-const WORD_FILE = './wordList.lst'; // Disimpan di folder yang sama dengan server.js
+// ==========================================
+// 1. INISIALISASI FIREBASE ADMIN
+// ==========================================
+// Mengambil kredensial dari Environment Variable Render agar aman
+if (!process.env.FIREBASE_CREDENTIALS || !process.env.FIREBASE_DB_URL) {
+    console.error("❌ ERROR FATAL: FIREBASE_CREDENTIALS atau FIREBASE_DB_URL belum diatur di Render!");
+    process.exit(1);
+}
 
-// Daftar key valid (Bisa kamu ubah/tambah sesuai kebutuhan)
+const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: process.env.FIREBASE_DB_URL
+});
+
+const db = admin.database();
+const wordsRef = db.ref('words'); // Kita simpan semua kata di folder "words"
+
+// Cache lokal untuk mempercepat pengiriman data ke Roblox
+let localWordsCache = [];
+
+// [SISTEM REAL-TIME] Setiap ada perubahan di database, RAM server otomatis diperbarui
+wordsRef.on('value', (snapshot) => {
+    const data = snapshot.val();
+    if (data) {
+        // Firebase menyimpan sebagai Object { "makan": true, "minum": true }
+        // Kita ubah menjadi Array ["makan", "minum"]
+        localWordsCache = Object.keys(data);
+    } else {
+        localWordsCache = [];
+    }
+    console.log(`[Firebase] Sinkronisasi Sukses! Total kata di RAM: ${localWordsCache.length}`);
+});
+
+// ==========================================
+// 2. KONFIGURASI KEAMANAN (API)
+// ==========================================
+const SECRET_KEY = "MingHubSuperSecretKey2026";
 const VALID_KEYS = ["minghub_premium_123", "test_key", "admin_key"];
 
-// ==========================================
-// FUNGSI KRIPTOGRAFI RC4
-// ==========================================
 function rc4(keyString, dataBuffer) {
     let s = Array.from({ length: 256 }, (_, i) => i);
     let j = 0;
@@ -34,23 +64,9 @@ function rc4(keyString, dataBuffer) {
 }
 
 // ==========================================
-// MANAJEMEN DATABASE KATA
+// 3. ENDPOINT API: /words
 // ==========================================
-function getWords() {
-    if (!fs.existsSync(WORD_FILE)) return [];
-    const data = fs.readFileSync(WORD_FILE, 'utf8');
-    return data.split('\n').map(w => w.trim()).filter(w => w.length > 0);
-}
-
-function saveWords(wordsArray) {
-    const uniqueWords = [...new Set(wordsArray)].sort();
-    fs.writeFileSync(WORD_FILE, uniqueWords.join('\n'), 'utf8');
-}
-
-// ==========================================
-// ENDPOINT 1: SISTEM KATA (/words)
-// ==========================================
-app.post('/words', (req, res) => {
+app.post('/words', async (req, res) => {
     try {
         const { nonce, payload } = req.body;
         if (!nonce || !payload) return res.status(400).json({ error: "Invalid Request" });
@@ -68,25 +84,31 @@ app.post('/words', (req, res) => {
         }
 
         const { action, word } = requestData;
-        let wordsList = getWords();
         let responseData = { success: true };
 
+        // LOGIKA FIREBASE
         if (action === "get") {
-            responseData.words = wordsList;
-        } else if (action === "add" && word) {
+            // Ambil dari Cache RAM, bukan dari DB (Sangat Cepat & Hemat Kuota Firebase)
+            responseData.words = localWordsCache; 
+        } 
+        else if (action === "add" && word) {
             const cleanWord = word.toLowerCase().trim();
-            if (!wordsList.includes(cleanWord) && !cleanWord.includes("#")) {
-                wordsList.push(cleanWord);
-                saveWords(wordsList);
+            if (!localWordsCache.includes(cleanWord)) {
+                // Simpan ke Firebase (Format: child("makan").set(true))
+                await wordsRef.child(cleanWord).set(true); 
+                console.log(`[+] Kata baru ditambahkan ke Firebase: ${cleanWord}`);
             }
             responseData.message = "Word added";
-        } else if (action === "delete" && word) {
+        } 
+        else if (action === "delete" && word) {
             const cleanWord = word.toLowerCase().trim();
-            wordsList = wordsList.filter(w => w !== cleanWord);
-            saveWords(wordsList);
+            // Hapus dari Firebase
+            await wordsRef.child(cleanWord).remove();
+            console.log(`[-] Kata salah dihapus dari Firebase: ${cleanWord}`);
             responseData.message = "Word deleted";
         }
 
+        // ENCRYPT RESPONSE KEMBALI
         const resNonce = Math.floor(Math.random() * 900000 + 100000).toString() + Date.now();
         const resSessionKey = SECRET_KEY + "_" + resNonce;
         const resJson = JSON.stringify(responseData);
@@ -95,12 +117,13 @@ app.post('/words', (req, res) => {
 
         return res.json({ nonce: resNonce, payload: resPayload });
     } catch (error) {
+        console.error("Server Error:", error);
         res.status(500).json({ error: "Internal Server Error" });
     }
 });
 
 // ==========================================
-// ENDPOINT 2: KEY SYSTEM (/checkkey)
+// 4. ENDPOINT API: /checkkey
 // ==========================================
 app.post('/checkkey', (req, res) => {
     try {
@@ -119,35 +142,26 @@ app.post('/checkkey', (req, res) => {
             return res.status(403).json({ error: "Security Error: Bad Decryption" });
         }
 
-        const { key, username, hwid } = requestData;
+        const { key, username } = requestData;
         let responseData = {};
 
-        // Validasi Kunci
         if (VALID_KEYS.includes(key)) {
             responseData = { valid: true, message: `Welcome to ZuperMing Hub, ${username}!` };
-            console.log(`[AUTH SUCCESS] User: ${username} | Key: ${key}`);
         } else {
-            responseData = { valid: false, message: "Invalid or Expired Key!" };
-            console.log(`[AUTH FAILED] User: ${username} | Key: ${key}`);
+            responseData = { valid: false, message: "Invalid Key!" };
         }
 
         const resNonce = Math.floor(Math.random() * 900000 + 100000).toString() + Date.now();
         const resSessionKey = SECRET_KEY + "_" + resNonce;
-        const resJson = JSON.stringify(responseData);
-        const resEncryptedBuffer = rc4(resSessionKey, Buffer.from(resJson, 'utf8'));
-        const resPayload = resEncryptedBuffer.toString('base64');
+        const resPayload = rc4(resSessionKey, Buffer.from(JSON.stringify(responseData), 'utf8')).toString('base64');
 
         return res.json({ nonce: resNonce, payload: resPayload });
-
     } catch (error) {
         res.status(500).json({ error: "Internal Server Error" });
     }
 });
 
-// ==========================================
-// JALANKAN SERVER
-// ==========================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🚀 MingHub Server berjalan di port ${PORT}`);
+    console.log(`🚀 MingHub Server + Firebase berjalan di port ${PORT}`);
 });
